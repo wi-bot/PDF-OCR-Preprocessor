@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/PdfOcrPreprocessor.Core/PdfOcrPreprocessor.Core.csproj" />
+  <Project Path="src/PdfOcrPreprocessor.Desktop/PdfOcrPreprocessor.Desktop.csproj" />
+  <Project Path="tests/PdfOcrPreprocessor.Tests/PdfOcrPreprocessor.Tests.csproj" />
+</Solution>

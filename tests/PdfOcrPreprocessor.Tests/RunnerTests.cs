@@ -41,6 +41,54 @@ public sealed class RunnerTests : IDisposable
         Assert.True(options.InventoryOnly);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SyntheticProviderRecordsMetricsAndOptionalSameFileOverlay(bool render)
+    {
+        var original = Path.Combine(directory, "original");
+        var provider = Path.Combine(directory, "provider");
+        var source = SyntheticPdf.Write(original, text: "");
+        var variant = SyntheticPdf.Write(provider, text: "SYNTHETIC $1,985,420.00");
+        File.Move(variant, Path.Combine(provider, Path.GetFileName(source)));
+        var selection = Path.Combine(directory, "selection.json");
+        ProofRunner.WriteJson(selection, new[] { new SelectedPage(Path.GetFileName(source), 1, "Synthetic fixture", render) });
+        var options = new ProofOptions([new("Original", original), new("SyntheticProvider", provider)],
+            Path.Combine(directory, "analysis"), Path.Combine(directory, "repository"), selection, true, false);
+        var output = ProofRunner.Run(options, new InlineProgress(_ => { }), default);
+        var results = JsonSerializer.Deserialize<PageResult[]>(File.ReadAllText(Path.Combine(output, "page-results.json")))!;
+        var page = Assert.Single(results, result => result.Source == "SyntheticProvider");
+        Assert.NotNull(page.Metrics);
+        Assert.True(page.Metrics.TextCharacters > 0);
+        Assert.True(page.Metrics.WordCount > 0);
+        Assert.Equal(0, page.Metrics.InvalidGlyphQuads);
+        Assert.Equal(0, page.Metrics.UnusableWords);
+        Assert.Equal(render ? "Passed" : "NotTested", page.Rendering);
+        Assert.Equal(render, File.Exists(Path.Combine(output, page.ArtifactPrefix + "-overlay.png")));
+        if (render)
+        {
+            Assert.True(page.Overlay!.DimensionsMatch);
+            Assert.Equal(page.Overlay.CheckedGlyphs, page.Overlay.GlyphsWithNearbyInk);
+        }
+        using var metrics = JsonDocument.Parse(File.ReadAllText(Path.Combine(output, "source-text-metrics.json")));
+        Assert.Equal(0, metrics.RootElement[0].GetProperty("OriginalCharacters").GetInt32());
+        Assert.Equal(JsonValueKind.Null, metrics.RootElement[0].GetProperty("Comparison").ValueKind);
+    }
+
+    [Fact]
+    public void GeometryMetricsFlagInvalidAndOutOfPageQuads()
+    {
+        var path = SyntheticPdf.Write(directory, text: "SYNTHETIC");
+        var evidence = new PdfOcrPreprocessor.Desktop.Pdf.PdfPigExtractor().Extract(path, "synthetic.pdf", "Synthetic", 1, default);
+        var glyphs = evidence.Glyphs.ToArray();
+        glyphs[0] = glyphs[0] with { DisplayQuad = Enumerable.Repeat(new PointD(0, 0), 4).ToArray() };
+        glyphs[1] = glyphs[1] with { DisplayQuad = glyphs[1].DisplayQuad.Select(point => point with { X = point.X + evidence.Geometry.DisplayWidth }).ToArray() };
+        var metrics = ProofRunner.Measure(evidence with { Glyphs = glyphs });
+        Assert.Equal(1, metrics.InvalidGlyphQuads);
+        Assert.Equal(1, metrics.OutOfPageGlyphQuads);
+        Assert.Equal(1, metrics.UnusableWords);
+    }
+
     [Fact]
     public void SyntheticViewerLoadsPageAndPaintsSamePageOverlay()
     {

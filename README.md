@@ -69,6 +69,16 @@ The publish helper retrieves the exact PDFium 7961 release archive and verifies 
 
 ## Validation And Stop Point
 
+### Adobe-Only Validation Extension
+
+The Phase 0.5 proof adds per-page Unicode-scalar character counts (grouped text, non-whitespace text and raw glyph strings), word/line counts, finite/nonzero glyph-quad checks, one-point-tolerance page-bound checks, word-to-glyph geometry checks and unassigned text-glyph counts. Selection entries accept optional `"Render": false` for extraction-only pages; omission preserves the Phase 0 render behavior. Every rendered page with extracted evidence also receives a same-file overlay PNG: red glyph quads and blue derived word bounds. The nearby-dark-pixel diagnostic uses a two-pixel bounding-box tolerance; it is only an alignment review aid, never an OCR accuracy/confidence measure. Ruled lines, scan noise and neighboring letters can produce false reassurance.
+
+```powershell
+& $dotnet run --project src/PdfOcrPreprocessor.Desktop -c Release --no-build -- --proof --provider Adobe=C:\EnronOCR\ADOBE --workspace C:\EnronAnalysis\Phase0.5-Adobe --samples C:\EnronAnalysis\Phase0.5-Adobe\all-adobe-pages.json
+```
+
+The externally generated all-page selection covers the discovered Adobe page ranges and enables renders for the previously reviewed representative pages. Per-page metrics are in each run's page-results JSON; original/provider text availability is reported separately from comparisons between providers. No similarity/accuracy score is assigned when the original has no text. The Adobe-specific report and CSV summaries live under `C:\EnronAnalysis\Phase0.5-Adobe`. Nonempty OCR text and finite geometry do not establish completeness, correct recognition, or visual alignment; consult the recorded exception pages. No OCR engines are executed and neither PDF root is modified.
+
 The complete machine-specific Phase 0 report is `C:\EnronAnalysis\Phase0\PHASE0-VALIDATION.md`; all corpus-derived manifests, renders, databases, hashes and reports stay outside this repository. Synthetic test artifacts use the OS temporary directory; TRX and optional viewer screenshots go to the analysis workspace. Set `PHASE0_SCREENSHOT_DIR` to an external directory to retain the synthetic STA viewer screenshot.
 
 Windows 10 22H2, a clean Windows 11 machine, actual network-disconnected execution and real multi-provider OCR evidence remain separate pending gates unless the external report records an actual test. Stop after Phase 0 findings and obtain approval before building the full application.

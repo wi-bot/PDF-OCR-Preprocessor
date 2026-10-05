@@ -55,10 +55,14 @@ public sealed record ProofOptions(SourceRoot[] Sources, string Workspace, string
 
 public sealed record InventoryFile(DiscoveredPdf File, int? PageCount, string? Sha256, string? Error);
 public sealed record Inventory(InventoryFile[] Files, DiscoveryIssue[] Issues, DocumentMatch[] Matches);
-public sealed record SelectedPage(string RelativePath, int PageNumber, string Reason);
+public sealed record SelectedPage(string RelativePath, int PageNumber, string Reason, bool Render = true);
+public sealed record TextGeometryMetrics(int TextCharacters, int NonWhitespaceCharacters, int RawGlyphCharacters,
+    int WordCount, int LineCount, int InvalidGlyphQuads, int OutOfPageGlyphQuads, int UnusableWords, int UnassignedTextGlyphs, string[] Warnings);
+public sealed record OverlayMetrics(bool DimensionsMatch, int CheckedGlyphs, int GlyphsWithNearbyInk);
 public sealed record PageResult(string Source, string RelativePath, int PageNumber, string ArtifactPrefix,
     string? HashBefore, string? HashAfter, bool? Unchanged, int? GlyphCount, int? ImageCount, long ElapsedMilliseconds,
-    string Extraction, string Rendering, string Persistence, string[] Errors);
+    string Extraction, string Rendering, string Persistence, string[] Errors,
+    TextGeometryMetrics? Metrics = null, OverlayMetrics? Overlay = null);
 
 public static class ProofRunner
 {
@@ -108,6 +112,7 @@ public static class ProofRunner
         WriteJson(Path.Combine(output, "selected-pages.json"), selected);
         var results = new List<PageResult>();
         var comparisons = new List<object>();
+        var sourceComparisons = new List<object>();
         var extractor = new PdfPigExtractor();
         var renderer = new PdfiumRenderer();
         var wasCancelled = false;
@@ -130,6 +135,8 @@ public static class ProofRunner
                     string? before = null;
                     string? after = null;
                     PageEvidence? evidence = null;
+                    TextGeometryMetrics? metrics = null;
+                    OverlayMetrics? overlayMetrics = null;
                     var extraction = "NotTested";
                     var rendering = "NotTested";
                     var persistence = "NotTested";
@@ -138,11 +145,12 @@ public static class ProofRunner
                         before = Hash(file.File.FullPath);
                         if (before != file.Sha256) throw new InvalidDataException("Source changed since inventory.");
                         evidence = extractor.Extract(file.File.FullPath, sample.RelativePath, file.File.Source, sample.PageNumber, cancellationToken);
+                        metrics = Measure(evidence);
                         extraction = evidence.Glyphs.Length == 0 ? "PassedNoText" : "PassedTextPresent";
                         WriteJson(Path.Combine(output, prefix + ".json"), evidence);
                     }
                     catch (Exception exception) when (Recoverable(exception)) { extraction = "Failed"; errors.Add($"Extraction: {exception}"); }
-                    try
+                    if (sample.Render) try
                     {
                         var image = renderer.Render(file.File.FullPath, sample.PageNumber, 144, cancellationToken);
                         File.WriteAllBytes(Path.Combine(output, prefix + ".png"), image.Png);
@@ -150,6 +158,8 @@ public static class ProofRunner
                             image.DisplayWidthPoints, image.DisplayHeightPoints, Annotations = true, FormFill = false, ExtraRotation = 0,
                             PngSha256 = Convert.ToHexString(SHA256.HashData(image.Png)) });
                         rendering = "Passed";
+                        if (evidence != null)
+                            overlayMetrics = WriteOverlay(image, evidence, Path.Combine(output, prefix + "-overlay.png"));
                     }
                     catch (Exception exception) when (Recoverable(exception)) { rendering = "Failed"; errors.Add($"Rendering: {exception}"); }
                     if (evidence != null)
@@ -167,7 +177,7 @@ public static class ProofRunner
                     if (evidence != null && before == after && before != null) pageEvidence.Add((file, evidence));
                     results.Add(new(file.File.Source, sample.RelativePath, sample.PageNumber, prefix, before, after,
                         before == null || after == null ? null : before == after, evidence?.Glyphs.Length, evidence?.ImageCount,
-                        elapsed.ElapsedMilliseconds, extraction, rendering, persistence, errors.ToArray()));
+                        elapsed.ElapsedMilliseconds, extraction, rendering, persistence, errors.ToArray(), metrics, overlayMetrics));
                     WriteJson(Path.Combine(output, "page-results.json"), results);
                     if (errors.Count > 0) Log($"Failure {prefix}: extraction={extraction}; rendering={rendering}; persistence={persistence}; see page-results.json.");
                 }
@@ -184,6 +194,17 @@ public static class ProofRunner
                     var extracted = pageEvidence.FirstOrDefault(item => item.File.File.Source == source.Name).Evidence;
                     return extracted == null ? new(null, "ExtractionFailedOrStale") : new(extracted.Text, PageCount: extracted.PageCount, FileHash: variant.Sha256);
                 }
+                foreach (var provider in providers)
+                {
+                    var originalInput = Input(options.Sources.Single(source => source.Name == "Original"));
+                    var providerInput = Input(provider);
+                    var hasBothText = !string.IsNullOrWhiteSpace(originalInput.Text) && !string.IsNullOrWhiteSpace(providerInput.Text);
+                    sourceComparisons.Add(new { sample.RelativePath, sample.PageNumber, Provider = provider.Name,
+                        OriginalState = originalInput.State, ProviderState = providerInput.State,
+                        OriginalCharacters = originalInput.Text?.EnumerateRunes().Count(), ProviderCharacters = providerInput.Text?.EnumerateRunes().Count(),
+                        Interpretation = hasBothText ? "Text agreement only, not OCR accuracy or verified page correspondence" : "Text availability only; no two-sided text evidence",
+                        Comparison = hasBothText ? Comparison.Compare(originalInput, providerInput, cancellationToken) : null });
+                }
                 for (var leftIndex = 0; leftIndex < providers.Length; leftIndex++)
                 for (var rightIndex = leftIndex + 1; rightIndex < providers.Length; rightIndex++)
                 {
@@ -196,6 +217,7 @@ public static class ProofRunner
         }
         catch (OperationCanceledException) { wasCancelled = true; Log("Cancelled between cooperative processing boundaries."); }
         WriteJson(Path.Combine(output, "comparisons.json"), comparisons);
+        WriteJson(Path.Combine(output, "source-text-metrics.json"), sourceComparisons);
         WriteJson(Path.Combine(output, "summary.json"), new
         {
             WasCancelled = wasCancelled,
@@ -215,7 +237,8 @@ public static class ProofRunner
             ElapsedMilliseconds = stopwatch.ElapsedMilliseconds,
             PeakWorkingSetBytes = Process.GetCurrentProcess().PeakWorkingSet64,
             Providers = options.Sources.Where(source => source.Name != "Original").Select(source => source.Name).ToArray(),
-            RealProviderValidation = comparisons.Count == 0 ? "PENDING: no eligible real provider pair tested" : "See comparisons; visual review pending",
+            ProviderExtractionPages = results.Count(result => result.Source != "Original" && result.Metrics != null),
+            CrossProviderComparison = comparisons.Count == 0 ? "Not tested: no provider pair compared; single-provider extraction is reported per page" : "Pair records emitted; inspect comparison states and visual findings",
             Geometry = "Synthetic pixel tests separate; corpus overlays require visual review. No registration.",
             Limitations = "In-process; cancellation cooperative; native crash or hang can terminate or block application. No automatic acceptance."
         });
@@ -240,6 +263,80 @@ public static class ProofRunner
             if (multiple != null) selected.Add(new(multiple.File.RelativePath, 2, "Second-page candidate for attachment/thread review; classification pending."));
         }
         return selected.Take(25).ToArray();
+    }
+
+    public static TextGeometryMetrics Measure(PageEvidence evidence)
+    {
+        var textGlyphs = evidence.Glyphs.Where(glyph => !string.IsNullOrWhiteSpace(glyph.Text)).ToArray();
+        var assigned = evidence.Words.SelectMany(word => word.GlyphIndices).ToHashSet();
+        return new(evidence.Text.EnumerateRunes().Count(), evidence.Text.EnumerateRunes().Count(rune => !System.Text.Rune.IsWhiteSpace(rune)),
+            evidence.Glyphs.Sum(glyph => glyph.Text.EnumerateRunes().Count()), evidence.Words.Length, evidence.Words.Select(word => word.Line).Distinct().Count(),
+            textGlyphs.Count(glyph => !UsableQuad(glyph.DisplayQuad)),
+            textGlyphs.Count(glyph => glyph.DisplayQuad.Any(point => point.X < -1 || point.Y < -1 || point.X > evidence.Geometry.DisplayWidth + 1 || point.Y > evidence.Geometry.DisplayHeight + 1)),
+            evidence.Words.Count(word => word.GlyphIndices.Length == 0 || word.GlyphIndices.Any(index => index < 0 || index >= evidence.Glyphs.Length || !UsableQuad(evidence.Glyphs[index].DisplayQuad))),
+            textGlyphs.Count(glyph => !assigned.Contains(glyph.Index)), evidence.Warnings);
+    }
+
+    private static bool UsableQuad(PointD[] points)
+    {
+        if (points.Length != 4 || points.Any(point => !double.IsFinite(point.X) || !double.IsFinite(point.Y))) return false;
+        var area = 0d;
+        for (var index = 0; index < points.Length; index++)
+        {
+            var next = points[(index + 1) % points.Length];
+            area += points[index].X * next.Y - next.X * points[index].Y;
+        }
+        return Math.Abs(area) > .000001;
+    }
+
+    public static OverlayMetrics WriteOverlay(RenderedPage image, PageEvidence evidence, string path)
+    {
+        if (!double.IsFinite(evidence.Geometry.DisplayWidth) || !double.IsFinite(evidence.Geometry.DisplayHeight) ||
+            evidence.Geometry.DisplayWidth <= 0 || evidence.Geometry.DisplayHeight <= 0) throw new InvalidDataException("Invalid overlay page dimensions.");
+        using var bitmap = SkiaSharp.SKBitmap.Decode(image.Png);
+        var scaleX = bitmap.Width / evidence.Geometry.DisplayWidth;
+        var scaleY = bitmap.Height / evidence.Geometry.DisplayHeight;
+        var checkedGlyphs = 0;
+        var hits = 0;
+        var glyphs = evidence.Glyphs.Where(glyph => !string.IsNullOrWhiteSpace(glyph.Text) && UsableQuad(glyph.DisplayQuad)).ToArray();
+        foreach (var glyph in glyphs)
+        {
+            var left = (int)Math.Clamp(Math.Floor(glyph.DisplayQuad.Min(point => point.X) * scaleX) - 2, 0, bitmap.Width);
+            var right = (int)Math.Clamp(Math.Ceiling(glyph.DisplayQuad.Max(point => point.X) * scaleX) + 2, 0, bitmap.Width);
+            var top = (int)Math.Clamp(Math.Floor(glyph.DisplayQuad.Min(point => point.Y) * scaleY) - 2, 0, bitmap.Height);
+            var bottom = (int)Math.Clamp(Math.Ceiling(glyph.DisplayQuad.Max(point => point.Y) * scaleY) + 2, 0, bitmap.Height);
+            if (right <= left || bottom <= top || (long)(right - left) * (bottom - top) > 50_000) continue;
+            checkedGlyphs++;
+            var hasInk = false;
+            for (var row = top; row < bottom && !hasInk; row++)
+            for (var column = left; column < right && !hasInk; column++)
+            {
+                var pixel = bitmap.GetPixel(column, row);
+                hasInk = pixel.Red < 180 && pixel.Green < 180 && pixel.Blue < 180;
+            }
+            if (hasInk) hits++;
+        }
+        using var canvas = new SkiaSharp.SKCanvas(bitmap);
+        canvas.Scale((float)scaleX, (float)scaleY);
+        using var paint = new SkiaSharp.SKPaint { Color = new(220, 30, 30, 170), Style = SkiaSharp.SKPaintStyle.Stroke, StrokeWidth = .4f, IsAntialias = true };
+        foreach (var glyph in glyphs)
+        {
+            canvas.DrawPoints(SkiaSharp.SKPointMode.Polygon, glyph.DisplayQuad.Append(glyph.DisplayQuad[0])
+                .Select(point => new SkiaSharp.SKPoint((float)point.X, (float)point.Y)).ToArray(), paint);
+        }
+        paint.Color = new(20, 100, 220, 150);
+        foreach (var word in evidence.Words)
+        {
+            if (word.GlyphIndices.Length == 0 || word.GlyphIndices.Any(index => index < 0 || index >= evidence.Glyphs.Length || !UsableQuad(evidence.Glyphs[index].DisplayQuad))) continue;
+            var points = word.GlyphIndices.SelectMany(index => evidence.Glyphs[index].DisplayQuad).ToArray();
+            canvas.DrawRect(new SkiaSharp.SKRect((float)points.Min(point => point.X), (float)points.Min(point => point.Y),
+                (float)points.Max(point => point.X), (float)points.Max(point => point.Y)), paint);
+        }
+        canvas.Flush();
+        using var encoded = bitmap.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+        File.WriteAllBytes(path, encoded.ToArray());
+        return new(Math.Abs(image.DisplayWidthPoints - evidence.Geometry.DisplayWidth) < .1 &&
+            Math.Abs(image.DisplayHeightPoints - evidence.Geometry.DisplayHeight) < .1, checkedGlyphs, hits);
     }
 
     public static object EnvironmentEvidence()
